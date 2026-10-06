@@ -51,7 +51,7 @@ type oauthConfig struct {
 	IntrospectionURL    string
 	ClientID            string
 	ClientSecret        string
-	RequiredScopes      []string
+	SupportedScopes     []string
 }
 
 func main() {
@@ -168,7 +168,8 @@ func main() {
 	runtime.WithTools(toolRegistry, toolExecutor, policyEngine)
 
 	mux := http.NewServeMux()
-	var bearerMiddleware func(http.Handler) http.Handler
+	var mcpBearerMiddleware func(http.Handler) http.Handler
+	var teamRunBearerMiddleware func(http.Handler) http.Handler
 	authMode := "development"
 	metadataURL := ""
 
@@ -197,7 +198,7 @@ func main() {
 		metadataHandler := mcpauth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
 			Resource:               cfg.ResourceURL,
 			AuthorizationServers:   []string{cfg.AuthorizationServer},
-			ScopesSupported:        cfg.RequiredScopes,
+			ScopesSupported:        cfg.SupportedScopes,
 			BearerMethodsSupported: []string{"header"},
 			ResourceName:            "Yun Agent Runtime MCP",
 		})
@@ -206,9 +207,13 @@ func main() {
 		}
 
 		canonicalVerifier := authn.RequireCanonicalUser(verifier.Verify, identityResolver)
-		bearerMiddleware = mcpauth.RequireBearerToken(canonicalVerifier, &mcpauth.RequireBearerTokenOptions{
+		mcpBearerMiddleware = mcpauth.RequireBearerToken(canonicalVerifier, &mcpauth.RequireBearerTokenOptions{
 			ResourceMetadataURL: metadataURL,
-			Scopes:              cfg.RequiredScopes,
+			ClockSkew:           30 * time.Second,
+		})
+		teamRunBearerMiddleware = mcpauth.RequireBearerToken(canonicalVerifier, &mcpauth.RequireBearerTokenOptions{
+			ResourceMetadataURL: metadataURL,
+			Scopes:              []string{authn.ScopeTeamRun},
 			ClockSkew:           30 * time.Second,
 		})
 		authMode = "oauth-introspection"
@@ -220,8 +225,8 @@ func main() {
 	}
 	mcpEndpoint := mcpserver.New(runtime, identityResolver, devTenant, devUser)
 	mcpHandler := mcpEndpoint.Handler()
-	if bearerMiddleware != nil {
-		mcpHandler = bearerMiddleware(mcpHandler)
+	if mcpBearerMiddleware != nil {
+		mcpHandler = mcpBearerMiddleware(mcpHandler)
 	}
 	mux.Handle("/mcp", mcpHandler)
 
@@ -271,8 +276,8 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
-	if bearerMiddleware != nil {
-		mux.Handle("POST /v1/team/run", bearerMiddleware(teamRunHandler))
+	if teamRunBearerMiddleware != nil {
+		mux.Handle("POST /v1/team/run", teamRunBearerMiddleware(teamRunHandler))
 	} else {
 		mux.Handle("POST /v1/team/run", teamRunHandler)
 	}
@@ -371,16 +376,20 @@ func resolveHTTPPrincipal(r *http.Request, devMode bool, resolver identity.Resol
 }
 
 func loadOAuthConfig() (oauthConfig, error) {
+	configuredScopes := parseScopes(os.Getenv("YAR_AUTH_SUPPORTED_SCOPES"))
+	if len(configuredScopes) == 0 {
+		configuredScopes = parseScopes(os.Getenv("YAR_AUTH_REQUIRED_SCOPES"))
+	}
 	cfg := oauthConfig{
 		ResourceURL:         strings.TrimSpace(os.Getenv("YAR_MCP_RESOURCE_URL")),
 		AuthorizationServer: strings.TrimRight(strings.TrimSpace(os.Getenv("YAR_AUTHORIZATION_SERVER")), "/"),
 		IntrospectionURL:    strings.TrimSpace(os.Getenv("YAR_AUTH_INTROSPECTION_URL")),
 		ClientID:            strings.TrimSpace(os.Getenv("YAR_AUTH_CLIENT_ID")),
 		ClientSecret:        os.Getenv("YAR_AUTH_CLIENT_SECRET"),
-		RequiredScopes:      parseScopes(os.Getenv("YAR_AUTH_REQUIRED_SCOPES")),
-	}
-	if len(cfg.RequiredScopes) == 0 {
-		cfg.RequiredScopes = []string{"yar:mcp"}
+		SupportedScopes: mergeScopes(
+			[]string{authn.ScopeProfileRead, authn.ScopeTeamRun},
+			configuredScopes,
+		),
 	}
 
 	missing := make([]string, 0, 5)
@@ -404,6 +413,25 @@ func loadOAuthConfig() (oauthConfig, error) {
 func parseScopes(raw string) []string {
 	raw = strings.ReplaceAll(raw, ",", " ")
 	return strings.Fields(raw)
+}
+
+func mergeScopes(groups ...[]string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, group := range groups {
+		for _, scope := range group {
+			scope = strings.TrimSpace(scope)
+			if scope == "" {
+				continue
+			}
+			if _, ok := seen[scope]; ok {
+				continue
+			}
+			seen[scope] = struct{}{}
+			out = append(out, scope)
+		}
+	}
+	return out
 }
 
 func protectedResourceMetadataLocations(resource string) (string, []string, error) {
