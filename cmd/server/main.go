@@ -27,6 +27,9 @@ import (
 	"github.com/gjellerup1857/yun-agent-runtime/internal/inference"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/mcpserver"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/memory"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/platformapi"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/platformgateway"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/platformstate"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/policy"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/provider"
 	anthropicprovider "github.com/gjellerup1857/yun-agent-runtime/internal/provider/anthropic"
@@ -167,6 +170,9 @@ func main() {
 	)
 	runtime.WithTools(toolRegistry, toolExecutor, policyEngine)
 
+	platformStore := platformstate.NewStore(db)
+	platformGateway := platformgateway.New(platformStore, runtime)
+
 	mux := http.NewServeMux()
 	var mcpBearerMiddleware func(http.Handler) http.Handler
 	var mcpScopeStepUp func(http.Handler) http.Handler
@@ -262,6 +268,10 @@ func main() {
 		})
 	})
 
+	principalResolver := func(r *http.Request) (identity.Principal, error) {
+		return resolveHTTPPrincipal(r, devMode, identityResolver)
+	}
+
 	teamRunHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req yarruntime.RunRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -269,7 +279,7 @@ func main() {
 			return
 		}
 
-		principal, err := resolveHTTPPrincipal(r, devMode, identityResolver)
+		principal, err := principalResolver(r)
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authenticated identity required"})
 			return
@@ -289,6 +299,13 @@ func main() {
 		mux.Handle("POST /v1/team/run", teamRunBearerMiddleware(teamRunHandler))
 	} else {
 		mux.Handle("POST /v1/team/run", teamRunHandler)
+	}
+
+	platformRunHandler := platformapi.New(platformGateway, principalResolver)
+	if teamRunBearerMiddleware != nil {
+		mux.Handle("POST /v1/platform/run", teamRunBearerMiddleware(platformRunHandler))
+	} else {
+		mux.Handle("POST /v1/platform/run", platformRunHandler)
 	}
 
 	if devMode {
