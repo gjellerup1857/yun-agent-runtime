@@ -1,6 +1,7 @@
 package platformapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,21 +11,17 @@ import (
 )
 
 type Gateway interface {
-	Run(ctx interface{ Done() <-chan struct{} }, req platformgateway.Request) (platformgateway.Response, error)
+	Run(ctx context.Context, req platformgateway.Request) (platformgateway.Response, error)
 }
 
 type PrincipalResolver func(*http.Request) (identity.Principal, error)
 
-type Service interface {
-	Run(ctx interface{ Done() <-chan struct{} }, req platformgateway.Request) (platformgateway.Response, error)
-}
-
 type Handler struct {
-	gateway          *platformgateway.Service
+	gateway          Gateway
 	resolvePrincipal PrincipalResolver
 }
 
-func New(gateway *platformgateway.Service, resolvePrincipal PrincipalResolver) *Handler {
+func New(gateway Gateway, resolvePrincipal PrincipalResolver) *Handler {
 	return &Handler{gateway: gateway, resolvePrincipal: resolvePrincipal}
 }
 
