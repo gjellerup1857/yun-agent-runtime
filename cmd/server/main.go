@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/gjellerup1857/yun-agent-runtime/internal/adminapi"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/approval"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/audit"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/inference"
@@ -148,6 +149,7 @@ func main() {
 	runtime.WithTools(toolRegistry, toolExecutor, policyEngine)
 
 	mux := http.NewServeMux()
+	adminapi.New(db, devTenantID, devUserID).Register(mux)
 	mcpEndpoint := mcpserver.New(runtime, devTenantID, devUserID)
 	mux.Handle("/mcp", mcpEndpoint.Handler())
 
