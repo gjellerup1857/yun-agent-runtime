@@ -145,6 +145,7 @@ func main() {
 		auditRepo,
 		[]tools.Backend{mocktools.New()},
 	)
+	runtime.WithTools(toolRegistry, toolExecutor, policyEngine)
 
 	mux := http.NewServeMux()
 	mcpEndpoint := mcpserver.New(runtime, devTenantID, devUserID)
