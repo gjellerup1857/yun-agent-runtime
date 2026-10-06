@@ -109,3 +109,19 @@ func TestActiveReceiptReturnsInProgress(t *testing.T) {
 		t.Fatalf("runtime should not run while receipt lease is active: calls=%d", runner.calls)
 	}
 }
+
+func TestUnknownSourceClientIsRejectedBeforeStateMutation(t *testing.T) {
+	state := &fakeState{}
+	runner := &fakeRunner{}
+	service := New(state, runner)
+	_, err := service.Run(context.Background(), Request{
+		TenantID: "tenant-1", UserID: "user-1", SourceClient: "spoofed-client",
+		ExternalConversationID: "conversation-ext", ExternalMessageID: "message-ext", Message: "continue",
+	})
+	if !errors.Is(err, ErrUnsupportedSourceClient) {
+		t.Fatalf("err=%v, want ErrUnsupportedSourceClient", err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runtime must not run for unsupported source client: calls=%d", runner.calls)
+	}
+}
