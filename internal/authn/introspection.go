@@ -34,6 +34,11 @@ func NewIntrospectionVerifier(cfg IntrospectionConfig, client *http.Client) (*In
 	if _, err := ValidateSecureURL(cfg.Endpoint); err != nil {
 		return nil, fmt.Errorf("OAuth introspection endpoint is invalid: %w", err)
 	}
+	if cfg.ExpectedIssuer != "" {
+		if _, err := ValidateSecureURL(cfg.ExpectedIssuer); err != nil {
+			return nil, fmt.Errorf("OAuth expected issuer is invalid: %w", err)
+		}
+	}
 	if strings.TrimSpace(cfg.ClientID) == "" {
 		return nil, fmt.Errorf("OAuth introspection client ID is required")
 	}
