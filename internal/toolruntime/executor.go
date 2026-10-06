@@ -15,13 +15,13 @@ import (
 )
 
 type Executor struct {
-	registry *tools.Registry
-	validator tools.SchemaValidator
-	policies *policy.Engine
-	approvals *approval.Service
+	registry   *tools.Registry
+	validator  tools.SchemaValidator
+	policies   *policy.Engine
+	approvals  *approval.Service
 	executions tools.ExecutionRepository
-	audit audit.Repository
-	backends map[string]tools.Backend
+	audit      audit.Repository
+	backends   map[string]tools.Backend
 }
 
 func NewExecutor(
@@ -38,13 +38,13 @@ func NewExecutor(
 		backendMap[backend.Name()] = backend
 	}
 	return &Executor{
-		registry: registry,
-		validator: validator,
-		policies: policies,
-		approvals: approvals,
+		registry:   registry,
+		validator:  validator,
+		policies:   policies,
+		approvals:  approvals,
 		executions: executions,
-		audit: auditRepo,
-		backends: backendMap,
+		audit:      auditRepo,
+		backends:   backendMap,
 	}
 }
 
@@ -61,16 +61,16 @@ func (e *Executor) Execute(ctx context.Context, inv tools.Invocation) (tools.Res
 	argumentsHash := hashArguments(inv.Arguments)
 	if !decision.Allowed {
 		_ = e.audit.Record(ctx, audit.Event{
-			TenantID: inv.TenantID,
-			UserID: inv.UserID,
-			TaskID: inv.TaskID,
-			AgentID: inv.AgentID,
-			EventType: "tool_denied",
+			TenantID:     inv.TenantID,
+			UserID:       inv.UserID,
+			TaskID:       inv.TaskID,
+			AgentID:      inv.AgentID,
+			EventType:    "tool_denied",
 			ResourceType: "tool",
-			ResourceID: tool.ID,
-			Action: string(tool.Operation),
-			Result: "denied",
-			PayloadHash: argumentsHash,
+			ResourceID:   tool.ID,
+			Action:       string(tool.Operation),
+			Result:       "denied",
+			PayloadHash:  argumentsHash,
 		})
 		return tools.Result{}, fmt.Errorf("%w: %s", tools.ErrToolDenied, decision.Reason)
 	}
@@ -83,32 +83,43 @@ func (e *Executor) Execute(ctx context.Context, inv tools.Invocation) (tools.Res
 	if decision.RequiresApproval {
 		if inv.ApprovalID == "" {
 			item, err := e.approvals.Request(ctx, approval.Approval{
-				TenantID: inv.TenantID,
-				UserID: inv.UserID,
-				TaskID: inv.TaskID,
-				AgentID: inv.AgentID,
-				ToolID: inv.ToolID,
+				TenantID:       inv.TenantID,
+				UserID:         inv.UserID,
+				TaskID:         inv.TaskID,
+				AgentID:        inv.AgentID,
+				ToolID:         inv.ToolID,
 				IdempotencyKey: inv.IdempotencyKey,
-				ArgumentsHash: argumentsHash,
-				Risk: tool.Risk,
+				ArgumentsHash:  argumentsHash,
+				Risk:           tool.Risk,
 			})
-			if err != nil { return tools.Result{}, err }
-			return tools.Result{}, &tools.ApprovalRequiredError{ApprovalID: item.ID}
-		}
-		approved, err := e.approvals.IsApproved(ctx, inv.TenantID, inv.ApprovalID)
-		if err != nil { return tools.Result{}, err }
-		if !approved {
-			return tools.Result{}, &tools.ApprovalRequiredError{ApprovalID: inv.ApprovalID}
+			if err != nil {
+				return tools.Result{}, err
+			}
+			if item.Status != approval.StatusApproved || !time.Now().UTC().Before(item.ExpiresAt) {
+				return tools.Result{}, &tools.ApprovalRequiredError{ApprovalID: item.ID}
+			}
+		} else {
+			approved, err := e.approvals.IsApproved(ctx, inv.TenantID, inv.ApprovalID)
+			if err != nil {
+				return tools.Result{}, err
+			}
+			if !approved {
+				return tools.Result{}, &tools.ApprovalRequiredError{ApprovalID: inv.ApprovalID}
+			}
 		}
 	}
 
 	if writeLike {
 		execution, acquired, err := e.executions.Acquire(ctx, inv, 2*time.Minute)
-		if err != nil { return tools.Result{}, err }
+		if err != nil {
+			return tools.Result{}, err
+		}
 		if !acquired {
 			if execution.Status == tools.ExecutionCompleted {
 				var cached tools.Result
-				if err := json.Unmarshal(execution.Result, &cached); err != nil { return tools.Result{}, err }
+				if err := json.Unmarshal(execution.Result, &cached); err != nil {
+					return tools.Result{}, err
+				}
 				return cached, nil
 			}
 			return tools.Result{}, tools.ErrExecutionInProgress
@@ -121,24 +132,44 @@ func (e *Executor) Execute(ctx context.Context, inv tools.Invocation) (tools.Res
 	}
 	result, err := backend.Execute(ctx, tool, inv.Arguments)
 	if err != nil {
-		if writeLike { _ = e.executions.Fail(ctx, inv.TenantID, inv.IdempotencyKey, "backend_error") }
+		if writeLike {
+			_ = e.executions.Fail(ctx, inv.TenantID, inv.IdempotencyKey, "backend_error")
+		}
 		_ = e.audit.Record(ctx, audit.Event{
-			TenantID: inv.TenantID, UserID: inv.UserID, TaskID: inv.TaskID, AgentID: inv.AgentID,
-			EventType: "tool_execution", ResourceType: "tool", ResourceID: tool.ID,
-			Action: string(tool.Operation), Result: "failed", PayloadHash: argumentsHash,
+			TenantID:     inv.TenantID,
+			UserID:       inv.UserID,
+			TaskID:       inv.TaskID,
+			AgentID:      inv.AgentID,
+			EventType:    "tool_execution",
+			ResourceType: "tool",
+			ResourceID:   tool.ID,
+			Action:       string(tool.Operation),
+			Result:       "failed",
+			PayloadHash:  argumentsHash,
 		})
 		return tools.Result{}, err
 	}
 
 	if writeLike {
 		raw, err := json.Marshal(result)
-		if err != nil { return tools.Result{}, err }
-		if err := e.executions.Complete(ctx, inv.TenantID, inv.IdempotencyKey, raw); err != nil { return tools.Result{}, err }
+		if err != nil {
+			return tools.Result{}, err
+		}
+		if err := e.executions.Complete(ctx, inv.TenantID, inv.IdempotencyKey, raw); err != nil {
+			return tools.Result{}, err
+		}
 	}
 	_ = e.audit.Record(ctx, audit.Event{
-		TenantID: inv.TenantID, UserID: inv.UserID, TaskID: inv.TaskID, AgentID: inv.AgentID,
-		EventType: "tool_execution", ResourceType: "tool", ResourceID: tool.ID,
-		Action: string(tool.Operation), Result: "success", PayloadHash: argumentsHash,
+		TenantID:     inv.TenantID,
+		UserID:       inv.UserID,
+		TaskID:       inv.TaskID,
+		AgentID:      inv.AgentID,
+		EventType:    "tool_execution",
+		ResourceType: "tool",
+		ResourceID:   tool.ID,
+		Action:       string(tool.Operation),
+		Result:       "success",
+		PayloadHash:  argumentsHash,
 	})
 	return result, nil
 }
