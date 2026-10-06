@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/gjellerup1857/yun-agent-runtime/internal/authn"
+)
 
 func TestProtectedResourceMetadataLocations(t *testing.T) {
 	metadataURL, paths, err := protectedResourceMetadataLocations("https://api.yar.example/mcp")
@@ -28,8 +33,19 @@ func TestProtectedResourceMetadataLocationsAllowsLoopbackHTTP(t *testing.T) {
 }
 
 func TestParseScopes(t *testing.T) {
-	got := parseScopes("yar:mcp, yar:team:run  yar:profile:read")
+	got := parseScopes("yar:profile:read, yar:team:run  yar:task:read")
 	if len(got) != 3 {
 		t.Fatalf("scopes = %#v", got)
+	}
+}
+
+func TestMergeScopesDeduplicatesAndKeepsCoreScopes(t *testing.T) {
+	got := mergeScopes(
+		[]string{authn.ScopeProfileRead, authn.ScopeTeamRun},
+		[]string{authn.ScopeTeamRun, "yar:task:read"},
+	)
+	want := []string{authn.ScopeProfileRead, authn.ScopeTeamRun, "yar:task:read"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mergeScopes = %#v, want %#v", got, want)
 	}
 }
