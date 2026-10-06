@@ -5,7 +5,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/gjellerup1857/yun-agent-runtime/internal/authn"
 )
 
 func TestProfileToolOverStreamableHTTP(t *testing.T) {
@@ -37,5 +40,29 @@ func TestProfileToolOverStreamableHTTP(t *testing.T) {
 	}
 	if result.IsError {
 		t.Fatalf("profile tool returned MCP error: %+v", result.Content)
+	}
+}
+
+func TestToolScopesAreIndependent(t *testing.T) {
+	server := New(nil, nil, "", "")
+
+	profileRequest := &mcp.CallToolRequest{Extra: &mcp.RequestExtra{TokenInfo: &mcpauth.TokenInfo{
+		Scopes: []string{authn.ScopeProfileRead},
+	}}}
+	if err := server.requireScopes(profileRequest, authn.ScopeProfileRead); err != nil {
+		t.Fatalf("profile scope rejected: %v", err)
+	}
+	if err := server.requireScopes(profileRequest, authn.ScopeTeamRun); err == nil {
+		t.Fatal("profile-only token unexpectedly authorized for team run")
+	}
+
+	teamRequest := &mcp.CallToolRequest{Extra: &mcp.RequestExtra{TokenInfo: &mcpauth.TokenInfo{
+		Scopes: []string{authn.ScopeTeamRun},
+	}}}
+	if err := server.requireScopes(teamRequest, authn.ScopeTeamRun); err != nil {
+		t.Fatalf("team-run scope rejected: %v", err)
+	}
+	if err := server.requireScopes(teamRequest, authn.ScopeProfileRead); err == nil {
+		t.Fatal("team-run-only token unexpectedly authorized for profile read")
 	}
 }
