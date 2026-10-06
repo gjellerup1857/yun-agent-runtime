@@ -39,10 +39,10 @@ func TestMCPScopeStepUpReturnsInsufficientScopeChallenge(t *testing.T) {
 		t.Fatalf("status = %d, want 403", w.Code)
 	}
 	challenge := w.Header().Get("WWW-Authenticate")
-	if !strings.Contains(challenge, `error="insufficient_scope"`) || !strings.Contains(challenge, `scope="yar:team:run"`) {
+	if !strings.Contains(challenge, "error=\"insufficient_scope\"") || !strings.Contains(challenge, "scope=\"yar:team:run\"") {
 		t.Fatalf("challenge = %q", challenge)
 	}
-	if !strings.Contains(challenge, `resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp"`) {
+	if !strings.Contains(challenge, "resource_metadata=\"https://api.example.com/.well-known/oauth-protected-resource/mcp\"") {
 		t.Fatalf("challenge missing resource metadata: %q", challenge)
 	}
 }
