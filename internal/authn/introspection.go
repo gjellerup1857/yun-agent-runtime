@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,6 +19,7 @@ type IntrospectionConfig struct {
 	ClientSecret     string
 	ExpectedIssuer   string
 	ExpectedAudience string
+	ClockSkew        time.Duration
 }
 
 type IntrospectionVerifier struct {
@@ -29,6 +31,9 @@ func NewIntrospectionVerifier(cfg IntrospectionConfig, client *http.Client) (*In
 	if strings.TrimSpace(cfg.Endpoint) == "" {
 		return nil, fmt.Errorf("OAuth introspection endpoint is required")
 	}
+	if _, err := url.ParseRequestURI(cfg.Endpoint); err != nil {
+		return nil, fmt.Errorf("OAuth introspection endpoint is invalid: %w", err)
+	}
 	if strings.TrimSpace(cfg.ClientID) == "" {
 		return nil, fmt.Errorf("OAuth introspection client ID is required")
 	}
@@ -37,6 +42,9 @@ func NewIntrospectionVerifier(cfg IntrospectionConfig, client *http.Client) (*In
 	}
 	if strings.TrimSpace(cfg.ExpectedAudience) == "" {
 		return nil, fmt.Errorf("OAuth expected audience is required")
+	}
+	if cfg.ClockSkew <= 0 {
+		cfg.ClockSkew = 30 * time.Second
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
@@ -73,6 +81,10 @@ type introspectionResponse struct {
 }
 
 func (v *IntrospectionVerifier) Verify(ctx context.Context, token string, _ *http.Request) (*mcpauth.TokenInfo, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("%w: access token is empty", mcpauth.ErrInvalidToken)
+	}
+
 	form := url.Values{}
 	form.Set("token", token)
 	form.Set("token_type_hint", "access_token")
@@ -82,6 +94,7 @@ func (v *IntrospectionVerifier) Verify(ctx context.Context, token string, _ *htt
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
 	req.SetBasicAuth(v.cfg.ClientID, v.cfg.ClientSecret)
 
 	res, err := v.http.Do(req)
@@ -94,7 +107,8 @@ func (v *IntrospectionVerifier) Verify(ctx context.Context, token string, _ *htt
 	}
 
 	var payload introspectionResponse
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+	decoder := json.NewDecoder(io.LimitReader(res.Body, 64<<10))
+	if err := decoder.Decode(&payload); err != nil {
 		return nil, fmt.Errorf("decode OAuth introspection response: %w", err)
 	}
 	if !payload.Active {
@@ -106,22 +120,34 @@ func (v *IntrospectionVerifier) Verify(ctx context.Context, token string, _ *htt
 	if payload.Exp <= 0 {
 		return nil, fmt.Errorf("%w: token expiration is missing", mcpauth.ErrInvalidToken)
 	}
-	if v.cfg.ExpectedIssuer != "" && payload.Iss != "" && payload.Iss != v.cfg.ExpectedIssuer {
+	if v.cfg.ExpectedIssuer != "" && payload.Iss != v.cfg.ExpectedIssuer {
 		return nil, fmt.Errorf("%w: issuer mismatch", mcpauth.ErrInvalidToken)
 	}
 	if !containsAudience(payload.Aud, v.cfg.ExpectedAudience) {
 		return nil, fmt.Errorf("%w: audience mismatch", mcpauth.ErrInvalidToken)
 	}
 
+	now := time.Now()
+	expiresAt := time.Unix(payload.Exp, 0)
+	if now.Add(-v.cfg.ClockSkew).After(expiresAt) {
+		return nil, fmt.Errorf("%w: access token expired", mcpauth.ErrInvalidToken)
+	}
+	if payload.Nbf > 0 && now.Add(v.cfg.ClockSkew).Before(time.Unix(payload.Nbf, 0)) {
+		return nil, fmt.Errorf("%w: access token is not active yet", mcpauth.ErrInvalidToken)
+	}
+	if payload.Iat > 0 && now.Add(v.cfg.ClockSkew).Before(time.Unix(payload.Iat, 0)) {
+		return nil, fmt.Errorf("%w: access token issued-at is in the future", mcpauth.ErrInvalidToken)
+	}
+
 	return &mcpauth.TokenInfo{
 		Scopes:     strings.Fields(payload.Scope),
-		Expiration: time.Unix(payload.Exp, 0),
+		Expiration: expiresAt,
 		UserID:     payload.Sub,
 		Extra: map[string]any{
-			"issuer":    payload.Iss,
-			"audience":  []string(payload.Aud),
-			"client_id": payload.ClientID,
-			"issued_at": payload.Iat,
+			"issuer":     payload.Iss,
+			"audience":   []string(payload.Aud),
+			"client_id":  payload.ClientID,
+			"issued_at":  payload.Iat,
 			"not_before": payload.Nbf,
 		},
 	}, nil
