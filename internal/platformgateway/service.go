@@ -12,7 +12,19 @@ import (
 	yarruntime "github.com/gjellerup1857/yun-agent-runtime/internal/runtime"
 )
 
-var ErrMessageInProgress = errors.New("platform message is already processing")
+var (
+	ErrMessageInProgress       = errors.New("platform message is already processing")
+	ErrUnsupportedSourceClient = errors.New("unsupported source client")
+)
+
+var allowedSourceClients = map[string]struct{}{
+	"chatgpt": {},
+	"claude":  {},
+	"gemini":  {},
+	"web":     {},
+	"cli":     {},
+	"api":     {},
+}
 
 type StateStore interface {
 	ResolveOrCreateConversation(ctx context.Context, tenantID, userID, sourceClient, externalConversationID, teamID, projectID string) (platformstate.Conversation, error)
@@ -60,18 +72,23 @@ func (s *Service) Run(ctx context.Context, req Request) (Response, error) {
 	if strings.TrimSpace(req.TenantID) == "" || strings.TrimSpace(req.UserID) == "" {
 		return Response{}, fmt.Errorf("canonical tenant and user identity are required")
 	}
-	if strings.TrimSpace(req.SourceClient) == "" || strings.TrimSpace(req.ExternalConversationID) == "" || strings.TrimSpace(req.ExternalMessageID) == "" {
-		return Response{}, fmt.Errorf("source client, conversation ID, and message ID are required")
+	if strings.TrimSpace(req.ExternalConversationID) == "" || strings.TrimSpace(req.ExternalMessageID) == "" {
+		return Response{}, fmt.Errorf("conversation ID and message ID are required")
 	}
 	if strings.TrimSpace(req.Message) == "" {
 		return Response{}, fmt.Errorf("message is required")
+	}
+
+	sourceClient, err := normalizeAndValidateSourceClient(req.SourceClient)
+	if err != nil {
+		return Response{}, err
 	}
 
 	conversation, err := s.state.ResolveOrCreateConversation(
 		ctx,
 		req.TenantID,
 		req.UserID,
-		req.SourceClient,
+		sourceClient,
 		req.ExternalConversationID,
 		"yun-product-engineering",
 		req.ProjectID,
@@ -84,7 +101,7 @@ func (s *Service) Run(ctx context.Context, req Request) (Response, error) {
 		ctx,
 		req.TenantID,
 		req.UserID,
-		req.SourceClient,
+		sourceClient,
 		req.ExternalMessageID,
 		s.lease,
 	)
@@ -133,4 +150,12 @@ func (s *Service) Run(ctx context.Context, req Request) (Response, error) {
 		return Response{}, err
 	}
 	return response, nil
+}
+
+func normalizeAndValidateSourceClient(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if _, ok := allowedSourceClients[value]; !ok {
+		return "", fmt.Errorf("%w: %q", ErrUnsupportedSourceClient, value)
+	}
+	return value, nil
 }
