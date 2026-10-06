@@ -31,7 +31,7 @@ func NewIntrospectionVerifier(cfg IntrospectionConfig, client *http.Client) (*In
 	if strings.TrimSpace(cfg.Endpoint) == "" {
 		return nil, fmt.Errorf("OAuth introspection endpoint is required")
 	}
-	if _, err := url.ParseRequestURI(cfg.Endpoint); err != nil {
+	if _, err := ValidateSecureURL(cfg.Endpoint); err != nil {
 		return nil, fmt.Errorf("OAuth introspection endpoint is invalid: %w", err)
 	}
 	if strings.TrimSpace(cfg.ClientID) == "" {
