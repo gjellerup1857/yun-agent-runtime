@@ -8,6 +8,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/gjellerup1857/yun-agent-runtime/internal/authn"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/identity"
 	yarruntime "github.com/gjellerup1857/yun-agent-runtime/internal/runtime"
 )
@@ -55,7 +56,7 @@ func New(runtime *yarruntime.Runtime, identities identity.Resolver, devTenantID,
 	s.mcp = mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "yar-agent-runtime",
-			Version: "0.2.0",
+			Version: "0.3.0",
 		},
 		nil,
 	)
@@ -98,6 +99,9 @@ func (s *Server) profileGet(
 	req *mcp.CallToolRequest,
 	_ ProfileInput,
 ) (*mcp.CallToolResult, ProfileOutput, error) {
+	if err := s.requireScopes(req, authn.ScopeProfileRead); err != nil {
+		return nil, ProfileOutput{}, err
+	}
 	principal, err := s.resolvePrincipal(ctx, req)
 	if err != nil {
 		return nil, ProfileOutput{}, err
@@ -114,6 +118,9 @@ func (s *Server) teamRun(
 	req *mcp.CallToolRequest,
 	input TeamRunInput,
 ) (*mcp.CallToolResult, TeamRunOutput, error) {
+	if err := s.requireScopes(req, authn.ScopeTeamRun); err != nil {
+		return nil, TeamRunOutput{}, err
+	}
 	principal, err := s.resolvePrincipal(ctx, req)
 	if err != nil {
 		return nil, TeamRunOutput{}, err
@@ -142,6 +149,16 @@ func (s *Server) teamRun(
 		MemoriesRead:    result.MemoriesRead,
 		MemoriesWritten: result.MemoriesWritten,
 	}, nil
+}
+
+func (s *Server) requireScopes(req *mcp.CallToolRequest, required ...string) error {
+	if req != nil && req.Extra != nil && req.Extra.TokenInfo != nil {
+		return authn.RequireScopes(req.Extra.TokenInfo, required...)
+	}
+	if s.dev != nil {
+		return nil
+	}
+	return authn.RequireScopes(nil, required...)
 }
 
 func (s *Server) resolvePrincipal(ctx context.Context, req *mcp.CallToolRequest) (identity.Principal, error) {
