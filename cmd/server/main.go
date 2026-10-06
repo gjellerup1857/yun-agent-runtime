@@ -169,6 +169,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	var mcpBearerMiddleware func(http.Handler) http.Handler
+	var mcpScopeStepUp func(http.Handler) http.Handler
 	var teamRunBearerMiddleware func(http.Handler) http.Handler
 	authMode := "development"
 	metadataURL := ""
@@ -186,6 +187,7 @@ func main() {
 			ClientSecret:     cfg.ClientSecret,
 			ExpectedIssuer:   cfg.AuthorizationServer,
 			ExpectedAudience: cfg.ResourceURL,
+			ClockSkew:        30 * time.Second,
 		}, &http.Client{Timeout: 10 * time.Second})
 		if err != nil {
 			log.Fatalf("OAuth verifier configuration invalid: %v", err)
@@ -211,6 +213,10 @@ func main() {
 			ResourceMetadataURL: metadataURL,
 			ClockSkew:           30 * time.Second,
 		})
+		mcpScopeStepUp = authn.MCPScopeStepUp(metadataURL, map[string][]string{
+			"yar_profile_get": {authn.ScopeProfileRead},
+			"yar_team_run":    {authn.ScopeTeamRun},
+		})
 		teamRunBearerMiddleware = mcpauth.RequireBearerToken(canonicalVerifier, &mcpauth.RequireBearerTokenOptions{
 			ResourceMetadataURL: metadataURL,
 			Scopes:              []string{authn.ScopeTeamRun},
@@ -225,6 +231,9 @@ func main() {
 	}
 	mcpEndpoint := mcpserver.New(runtime, identityResolver, devTenant, devUser)
 	mcpHandler := mcpEndpoint.Handler()
+	if mcpScopeStepUp != nil {
+		mcpHandler = mcpScopeStepUp(mcpHandler)
+	}
 	if mcpBearerMiddleware != nil {
 		mcpHandler = mcpBearerMiddleware(mcpHandler)
 	}
