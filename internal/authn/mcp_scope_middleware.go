@@ -36,11 +36,8 @@ func MCPScopeStepUp(resourceMetadataURL string, toolScopes map[string][]string) 
 				return
 			}
 
-			params := []string{`error="insufficient_scope"`}
-			params[0] = strings.ReplaceAll(params[0], `\"`, `"`)
-			if len(required) > 0 {
-				params = append(params, fmt.Sprintf("scope=%q", strings.Join(required, " ")))
-			}
+			params := []string{fmt.Sprintf("error=%q", "insufficient_scope")}
+			params = append(params, fmt.Sprintf("scope=%q", strings.Join(required, " ")))
 			if resourceMetadataURL != "" {
 				params = append(params, fmt.Sprintf("resource_metadata=%q", resourceMetadataURL))
 			}
