@@ -205,7 +205,8 @@ func main() {
 			mux.Handle(path, metadataHandler)
 		}
 
-		bearerMiddleware = mcpauth.RequireBearerToken(verifier.Verify, &mcpauth.RequireBearerTokenOptions{
+		canonicalVerifier := authn.RequireCanonicalUser(verifier.Verify, identityResolver)
+		bearerMiddleware = mcpauth.RequireBearerToken(canonicalVerifier, &mcpauth.RequireBearerTokenOptions{
 			ResourceMetadataURL: metadataURL,
 			Scopes:              cfg.RequiredScopes,
 			ClockSkew:           30 * time.Second,
