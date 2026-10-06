@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/gjellerup1857/yun-agent-runtime/internal/inference"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/memory"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/provider"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/routing"
@@ -16,11 +17,12 @@ import (
 const defaultTeamID = "yun-product-engineering"
 
 type Runtime struct {
-	router    *routing.Router
-	provider  provider.Provider
-	memories  memory.Repository
-	tasks     task.Repository
-	extractor *memory.Extractor
+	router      *routing.Router
+	modelRouter *routing.ModelRouter
+	inference   *inference.Service
+	memories    memory.Repository
+	tasks       task.Repository
+	extractor   *memory.Extractor
 }
 
 type RunRequest struct {
@@ -32,9 +34,11 @@ type RunRequest struct {
 }
 
 type AgentResult struct {
-	AgentID string            `json:"agent_id"`
-	Output  string            `json:"output"`
-	Usage   provider.Response `json:"usage"`
+	AgentID  string         `json:"agent_id"`
+	Provider string         `json:"provider"`
+	Model    string         `json:"model"`
+	Output   string         `json:"output"`
+	Usage    provider.Usage `json:"usage"`
 }
 
 type RunResponse struct {
@@ -49,11 +53,47 @@ type RunResponse struct {
 }
 
 func New(router *routing.Router, p provider.Provider) *Runtime {
-	return &Runtime{router: router, provider: p}
+	registry := provider.NewRegistry()
+	registry.Register(p)
+	modelID := p.Name()
+	modelName := "mock-balanced"
+	if p.Name() != "mock" {
+		modelName = "test-model"
+	}
+	models := map[string]provider.ModelRef{
+		modelID: {ID: modelID, Provider: p.Name(), Model: modelName},
+	}
+	if p.Name() != "mock" {
+		models["mock"] = provider.ModelRef{ID: "mock", Provider: p.Name(), Model: modelName}
+	}
+	return NewMulti(router, routing.NewModelRouter(models), inference.New(registry), nil, nil, nil)
 }
 
 func NewStateful(router *routing.Router, p provider.Provider, memories memory.Repository, tasks task.Repository, extractor *memory.Extractor) *Runtime {
-	return &Runtime{router: router, provider: p, memories: memories, tasks: tasks, extractor: extractor}
+	registry := provider.NewRegistry()
+	registry.Register(p)
+	models := map[string]provider.ModelRef{
+		"mock": {ID: "mock", Provider: p.Name(), Model: "mock-balanced"},
+	}
+	return NewMulti(router, routing.NewModelRouter(models), inference.New(registry), memories, tasks, extractor)
+}
+
+func NewMulti(
+	router *routing.Router,
+	modelRouter *routing.ModelRouter,
+	inferenceService *inference.Service,
+	memories memory.Repository,
+	tasks task.Repository,
+	extractor *memory.Extractor,
+) *Runtime {
+	return &Runtime{
+		router: router,
+		modelRouter: modelRouter,
+		inference: inferenceService,
+		memories: memories,
+		tasks: tasks,
+		extractor: extractor,
+	}
 }
 
 func (r *Runtime) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
@@ -113,15 +153,25 @@ func (r *Runtime) Run(ctx context.Context, req RunRequest) (RunResponse, error) 
 			}
 		}
 
-		resp, err := r.provider.Generate(ctx, provider.Request{
-			Model: "mock-balanced",
+		candidates := r.modelRouter.Route(agentID)
+		if len(candidates) == 0 {
+			return RunResponse{}, fmt.Errorf("no model candidate for agent %s", agentID)
+		}
+		resp, selectedModel, err := r.inference.Generate(ctx, candidates, provider.Request{
 			System: system,
 			Input: message,
+			MaxOutputTokens: 4096,
 		})
 		if err != nil {
 			return RunResponse{}, err
 		}
-		results = append(results, AgentResult{AgentID: agentID, Output: resp.Text, Usage: resp})
+		results = append(results, AgentResult{
+			AgentID: agentID,
+			Provider: selectedModel.Provider,
+			Model: selectedModel.Model,
+			Output: resp.Text,
+			Usage: resp.Usage,
+		})
 		if i > 0 {
 			answer.WriteString("\n\n")
 		}
