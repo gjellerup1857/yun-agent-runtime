@@ -18,6 +18,8 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: false
+      - name: Resolve modules
+        run: go mod tidy
       - name: Format workspace
         run: gofmt -w .
       - name: Vet
