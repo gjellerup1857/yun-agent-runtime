@@ -7,11 +7,26 @@ services:
       YAR_ADDR: :8080
       YAR_DEV_MODE: "true"
       DATABASE_URL: postgres://yar:yar_dev@postgres:5432/yar
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+
+  admin:
+    build:
+      context: ../admin
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - yar
 
   postgres:
     image: pgvector/pgvector:pg17
