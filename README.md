@@ -19,6 +19,8 @@ Portable, governed multi-agent runtime for running the same AI team across model
 - Go HTTP runtime
 - `GET /healthz`
 - `POST /v1/team/run`
+- stateless Streamable HTTP MCP endpoint at `POST /mcp`
+- MCP tools: `yar_profile_get`, `yar_team_run`
 - deterministic 9-agent routing
 - zero-cost Mock provider
 - PostgreSQL + pgvector schema
@@ -33,7 +35,7 @@ Portable, governed multi-agent runtime for running the same AI team across model
 - Docker Compose local stack
 - GitHub Actions CI
 
-Remote MCP, real model providers and the Preact admin console are still being added.
+Real model providers, OAuth canonical identity and the Preact admin console are still being added.
 
 ## Requirements
 
@@ -63,7 +65,8 @@ Expected shape:
 {
   "status": "ok",
   "database": "ok",
-  "provider": "mock"
+  "provider": "mock",
+  "mcp": "/mcp"
 }
 ```
 
@@ -72,6 +75,23 @@ Run the whole MVP smoke flow:
 ```bash
 make smoke
 ```
+
+## Remote MCP
+
+YAR exposes the official Model Context Protocol Streamable HTTP transport at:
+
+```text
+http://localhost:8080/mcp
+```
+
+The server uses the official `github.com/modelcontextprotocol/go-sdk` and runs the HTTP transport in stateless mode for the 2026-07-28 protocol revision.
+
+Current MCP tools:
+
+- `yar_profile_get` — returns the canonical YAR identity connected to the endpoint.
+- `yar_team_run` — runs or resumes the persistent YAR product engineering team.
+
+The MVP currently binds `/mcp` to the development identity. Production OAuth/OIDC identity resolution is intentionally not enabled yet.
 
 ## Stateful team run
 
@@ -152,7 +172,7 @@ make smoke
 ## Current architecture
 
 ```text
-Client
+MCP Client / REST Client
   -> YAR HTTP Gateway
   -> Agent Router
   -> Stateful Runtime
@@ -172,10 +192,9 @@ Client
 ## Next implementation targets
 
 1. Provider Registry + OpenAI / Anthropic / Gemini adapters
-2. Agent tool-calling loop
-3. Remote MCP server
-4. OAuth canonical identity
-5. Preact admin console
-6. Cross-platform ChatGPT / Claude / Gemini E2E
+2. Agent model tool-calling loop
+3. OAuth/OIDC canonical identity
+4. Preact admin console
+5. Cross-platform ChatGPT / Claude / Gemini E2E
 
 Development work is reviewed in PRs before merging to `main`.
