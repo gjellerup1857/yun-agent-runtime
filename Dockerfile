@@ -2,6 +2,7 @@ FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY . .
+RUN go mod tidy
 RUN go test ./...
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/yar-server ./cmd/server
 
