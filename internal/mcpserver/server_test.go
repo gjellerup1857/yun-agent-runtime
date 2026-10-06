@@ -9,7 +9,7 @@ import (
 )
 
 func TestProfileToolOverStreamableHTTP(t *testing.T) {
-	server := New(nil, "tenant-test", "user-test")
+	server := New(nil, nil, "tenant-test", "user-test")
 	httpServer := httptest.NewServer(server.Handler())
 	defer httpServer.Close()
 
