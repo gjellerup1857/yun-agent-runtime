@@ -15,6 +15,7 @@ import (
 
 	"github.com/gjellerup1857/yun-agent-runtime/internal/approval"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/audit"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/mcpserver"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/memory"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/policy"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/provider"
@@ -113,6 +114,9 @@ func main() {
 	)
 
 	mux := http.NewServeMux()
+	mcpEndpoint := mcpserver.New(runtime, devTenantID, devUserID)
+	mux.Handle("/mcp", mcpEndpoint.Handler())
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -120,7 +124,7 @@ func main() {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "degraded", "database": "unavailable"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "database": "ok", "provider": llm.Name()})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "database": "ok", "provider": llm.Name(), "mcp": "/mcp"})
 	})
 
 	mux.HandleFunc("POST /v1/team/run", func(w http.ResponseWriter, r *http.Request) {
