@@ -4,18 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 
 	"github.com/gjellerup1857/yun-agent-runtime/internal/adminapi"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/approval"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/audit"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/authn"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/identity"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/inference"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/mcpserver"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/memory"
@@ -37,10 +45,20 @@ const (
 	devUserID   = "00000000-0000-0000-0000-000000000101"
 )
 
+type oauthConfig struct {
+	ResourceURL         string
+	AuthorizationServer string
+	IntrospectionURL    string
+	ClientID            string
+	ClientSecret        string
+	RequiredScopes      []string
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	devMode := os.Getenv("YAR_DEV_MODE") == "true"
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = "postgres://yar:yar_dev@localhost:5432/yar"
@@ -59,6 +77,7 @@ func main() {
 
 	memoryRepo := memory.NewPostgresRepository(db)
 	taskRepo := task.NewPostgresRepository(db)
+	identityResolver := identity.NewPostgresResolver(db)
 	agentRouter := routing.New()
 
 	providerRegistry := provider.NewRegistry()
@@ -149,9 +168,61 @@ func main() {
 	runtime.WithTools(toolRegistry, toolExecutor, policyEngine)
 
 	mux := http.NewServeMux()
-	adminapi.New(db, devTenantID, devUserID).Register(mux)
-	mcpEndpoint := mcpserver.New(runtime, devTenantID, devUserID)
-	mux.Handle("/mcp", mcpEndpoint.Handler())
+	var bearerMiddleware func(http.Handler) http.Handler
+	authMode := "development"
+	metadataURL := ""
+
+	if devMode {
+		adminapi.New(db, devTenantID, devUserID).Register(mux)
+	} else {
+		cfg, err := loadOAuthConfig()
+		if err != nil {
+			log.Fatalf("OAuth configuration invalid: %v", err)
+		}
+		verifier, err := authn.NewIntrospectionVerifier(authn.IntrospectionConfig{
+			Endpoint:         cfg.IntrospectionURL,
+			ClientID:         cfg.ClientID,
+			ClientSecret:     cfg.ClientSecret,
+			ExpectedIssuer:   cfg.AuthorizationServer,
+			ExpectedAudience: cfg.ResourceURL,
+		}, &http.Client{Timeout: 10 * time.Second})
+		if err != nil {
+			log.Fatalf("OAuth verifier configuration invalid: %v", err)
+		}
+
+		metadataURL, metadataPaths, err := protectedResourceMetadataLocations(cfg.ResourceURL)
+		if err != nil {
+			log.Fatalf("OAuth protected resource metadata invalid: %v", err)
+		}
+		metadataHandler := mcpauth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+			Resource:               cfg.ResourceURL,
+			AuthorizationServers:   []string{cfg.AuthorizationServer},
+			ScopesSupported:        cfg.RequiredScopes,
+			BearerMethodsSupported: []string{"header"},
+			ResourceName:            "Yun Agent Runtime MCP",
+		})
+		for _, path := range metadataPaths {
+			mux.Handle(path, metadataHandler)
+		}
+
+		bearerMiddleware = mcpauth.RequireBearerToken(verifier.Verify, &mcpauth.RequireBearerTokenOptions{
+			ResourceMetadataURL: metadataURL,
+			Scopes:              cfg.RequiredScopes,
+			ClockSkew:           30 * time.Second,
+		})
+		authMode = "oauth-introspection"
+	}
+
+	devTenant, devUser := "", ""
+	if devMode {
+		devTenant, devUser = devTenantID, devUserID
+	}
+	mcpEndpoint := mcpserver.New(runtime, identityResolver, devTenant, devUser)
+	mcpHandler := mcpEndpoint.Handler()
+	if bearerMiddleware != nil {
+		mcpHandler = bearerMiddleware(mcpHandler)
+	}
+	mux.Handle("/mcp", mcpHandler)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -161,9 +232,12 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":   "ok",
-			"database": "ok",
-			"mcp":      "/mcp",
+			"status":                "ok",
+			"database":              "ok",
+			"mcp":                   "/mcp",
+			"auth_mode":             authMode,
+			"mcp_protected":         !devMode,
+			"resource_metadata_url": metadataURL,
 			"providers": map[string]bool{
 				"mock":      providerRegistry.Has("mock"),
 				"openai":    providerRegistry.Has("openai"),
@@ -173,29 +247,20 @@ func main() {
 		})
 	})
 
-	mux.HandleFunc("POST /v1/team/run", func(w http.ResponseWriter, r *http.Request) {
+	teamRunHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req yarruntime.RunRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 			return
 		}
 
-		tenantID := r.Header.Get("X-YAR-Tenant-ID")
-		userID := r.Header.Get("X-YAR-User-ID")
-		if os.Getenv("YAR_DEV_MODE") == "true" {
-			if tenantID == "" {
-				tenantID = devTenantID
-			}
-			if userID == "" {
-				userID = devUserID
-			}
-		}
-		if tenantID == "" || userID == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "identity required"})
+		principal, err := resolveHTTPPrincipal(r, devMode, identityResolver)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authenticated identity required"})
 			return
 		}
-		req.TenantID = tenantID
-		req.UserID = userID
+		req.TenantID = principal.TenantID
+		req.UserID = principal.UserID
 
 		result, err := runtime.Run(r.Context(), req)
 		if err != nil {
@@ -205,65 +270,64 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	if bearerMiddleware != nil {
+		mux.Handle("POST /v1/team/run", bearerMiddleware(teamRunHandler))
+	} else {
+		mux.Handle("POST /v1/team/run", teamRunHandler)
+	}
 
-	mux.HandleFunc("POST /v1/dev/tools/execute", func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("YAR_DEV_MODE") != "true" {
-			http.NotFound(w, r)
-			return
-		}
-		var body struct {
-			AgentID        string          `json:"agent_id"`
-			ToolID         string          `json:"tool_id"`
-			TaskID         string          `json:"task_id"`
-			IdempotencyKey string          `json:"idempotency_key"`
-			ApprovalID     string          `json:"approval_id"`
-			Arguments      json.RawMessage `json:"arguments"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
-			return
-		}
-		result, err := toolExecutor.Execute(r.Context(), tools.Invocation{
-			TenantID:       devTenantID,
-			UserID:         devUserID,
-			TaskID:         body.TaskID,
-			AgentID:        body.AgentID,
-			ToolID:         body.ToolID,
-			Arguments:      body.Arguments,
-			IdempotencyKey: body.IdempotencyKey,
-			ApprovalID:     body.ApprovalID,
+	if devMode {
+		mux.HandleFunc("POST /v1/dev/tools/execute", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				AgentID        string          `json:"agent_id"`
+				ToolID         string          `json:"tool_id"`
+				TaskID         string          `json:"task_id"`
+				IdempotencyKey string          `json:"idempotency_key"`
+				ApprovalID     string          `json:"approval_id"`
+				Arguments      json.RawMessage `json:"arguments"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+				return
+			}
+			result, err := toolExecutor.Execute(r.Context(), tools.Invocation{
+				TenantID:       devTenantID,
+				UserID:         devUserID,
+				TaskID:         body.TaskID,
+				AgentID:        body.AgentID,
+				ToolID:         body.ToolID,
+				Arguments:      body.Arguments,
+				IdempotencyKey: body.IdempotencyKey,
+				ApprovalID:     body.ApprovalID,
+			})
+			if err != nil {
+				var approvalErr *tools.ApprovalRequiredError
+				if errors.As(err, &approvalErr) {
+					writeJSON(w, http.StatusConflict, map[string]any{
+						"error":       "APPROVAL_REQUIRED",
+						"approval_id": approvalErr.ApprovalID,
+					})
+					return
+				}
+				if errors.Is(err, tools.ErrToolDenied) {
+					writeJSON(w, http.StatusForbidden, map[string]any{"error": "TOOL_DENIED"})
+					return
+				}
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, result)
 		})
-		if err != nil {
-			var approvalErr *tools.ApprovalRequiredError
-			if errors.As(err, &approvalErr) {
-				writeJSON(w, http.StatusConflict, map[string]any{
-					"error":       "APPROVAL_REQUIRED",
-					"approval_id": approvalErr.ApprovalID,
-				})
-				return
-			}
-			if errors.Is(err, tools.ErrToolDenied) {
-				writeJSON(w, http.StatusForbidden, map[string]any{"error": "TOOL_DENIED"})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
 
-	mux.HandleFunc("POST /v1/dev/approvals/{id}/approve", func(w http.ResponseWriter, r *http.Request) {
-		if os.Getenv("YAR_DEV_MODE") != "true" {
-			http.NotFound(w, r)
-			return
-		}
-		approvalID := r.PathValue("id")
-		if err := approvalRepo.Resolve(r.Context(), devTenantID, devUserID, approvalID, approval.StatusApproved); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"approved": true, "approval_id": approvalID})
-	})
+		mux.HandleFunc("POST /v1/dev/approvals/{id}/approve", func(w http.ResponseWriter, r *http.Request) {
+			approvalID := r.PathValue("id")
+			if err := approvalRepo.Resolve(r.Context(), devTenantID, devUserID, approvalID, approval.StatusApproved); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"approved": true, "approval_id": approvalID})
+		})
+	}
 
 	addr := os.Getenv("YAR_ADDR")
 	if addr == "" {
@@ -283,6 +347,96 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown failed: %v", err)
 	}
+}
+
+func resolveHTTPPrincipal(r *http.Request, devMode bool, resolver identity.Resolver) (identity.Principal, error) {
+	if devMode {
+		tenantID := strings.TrimSpace(r.Header.Get("X-YAR-Tenant-ID"))
+		userID := strings.TrimSpace(r.Header.Get("X-YAR-User-ID"))
+		if tenantID == "" {
+			tenantID = devTenantID
+		}
+		if userID == "" {
+			userID = devUserID
+		}
+		return identity.Principal{TenantID: tenantID, UserID: userID, DisplayName: "YAR Developer"}, nil
+	}
+
+	info := mcpauth.TokenInfoFromContext(r.Context())
+	if info == nil || strings.TrimSpace(info.UserID) == "" {
+		return identity.Principal{}, fmt.Errorf("bearer token identity missing")
+	}
+	return resolver.Resolve(r.Context(), info.UserID)
+}
+
+func loadOAuthConfig() (oauthConfig, error) {
+	cfg := oauthConfig{
+		ResourceURL:         strings.TrimSpace(os.Getenv("YAR_MCP_RESOURCE_URL")),
+		AuthorizationServer: strings.TrimRight(strings.TrimSpace(os.Getenv("YAR_AUTHORIZATION_SERVER")), "/"),
+		IntrospectionURL:    strings.TrimSpace(os.Getenv("YAR_AUTH_INTROSPECTION_URL")),
+		ClientID:            strings.TrimSpace(os.Getenv("YAR_AUTH_CLIENT_ID")),
+		ClientSecret:        os.Getenv("YAR_AUTH_CLIENT_SECRET"),
+		RequiredScopes:      parseScopes(os.Getenv("YAR_AUTH_REQUIRED_SCOPES")),
+	}
+	if len(cfg.RequiredScopes) == 0 {
+		cfg.RequiredScopes = []string{"yar:mcp"}
+	}
+
+	missing := make([]string, 0, 5)
+	for name, value := range map[string]string{
+		"YAR_MCP_RESOURCE_URL":       cfg.ResourceURL,
+		"YAR_AUTHORIZATION_SERVER":   cfg.AuthorizationServer,
+		"YAR_AUTH_INTROSPECTION_URL": cfg.IntrospectionURL,
+		"YAR_AUTH_CLIENT_ID":         cfg.ClientID,
+		"YAR_AUTH_CLIENT_SECRET":     cfg.ClientSecret,
+	} {
+		if value == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return oauthConfig{}, fmt.Errorf("missing environment variables: %s", strings.Join(missing, ", "))
+	}
+	return cfg, nil
+}
+
+func parseScopes(raw string) []string {
+	raw = strings.ReplaceAll(raw, ",", " ")
+	return strings.Fields(raw)
+}
+
+func protectedResourceMetadataLocations(resource string) (string, []string, error) {
+	u, err := url.Parse(resource)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", nil, fmt.Errorf("resource must be an absolute URL")
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", nil, fmt.Errorf("resource URL must not contain user info, query, or fragment")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+		return "", nil, fmt.Errorf("resource URL must use HTTPS unless it is loopback")
+	}
+
+	const root = "/.well-known/oauth-protected-resource"
+	resourcePath := strings.TrimSuffix(u.Path, "/")
+	metadataPath := root
+	if resourcePath != "" {
+		metadataPath += resourcePath
+	}
+	metadataURL := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: metadataPath}).String()
+	paths := []string{metadataPath}
+	if metadataPath != root {
+		paths = append(paths, root)
+	}
+	return metadataURL, paths, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
