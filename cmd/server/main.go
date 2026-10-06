@@ -15,10 +15,14 @@ import (
 
 	"github.com/gjellerup1857/yun-agent-runtime/internal/approval"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/audit"
+	"github.com/gjellerup1857/yun-agent-runtime/internal/inference"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/mcpserver"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/memory"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/policy"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/provider"
+	anthropicprovider "github.com/gjellerup1857/yun-agent-runtime/internal/provider/anthropic"
+	googleprovider "github.com/gjellerup1857/yun-agent-runtime/internal/provider/google"
+	openaiprovider "github.com/gjellerup1857/yun-agent-runtime/internal/provider/openai"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/routing"
 	yarruntime "github.com/gjellerup1857/yun-agent-runtime/internal/runtime"
 	"github.com/gjellerup1857/yun-agent-runtime/internal/task"
@@ -54,48 +58,77 @@ func main() {
 
 	memoryRepo := memory.NewPostgresRepository(db)
 	taskRepo := task.NewPostgresRepository(db)
-	router := routing.New()
-	llm := provider.NewMock()
-	runtime := yarruntime.NewStateful(router, llm, memoryRepo, taskRepo, memory.NewExtractor())
+	agentRouter := routing.New()
+
+	providerRegistry := provider.NewRegistry()
+	providerRegistry.Register(provider.NewMock())
+	models := map[string]provider.ModelRef{
+		"mock": {ID: "mock", Provider: "mock", Model: "mock-balanced"},
+	}
+	httpClient := provider.NewHTTPClient()
+
+	if key, model := os.Getenv("OPENAI_API_KEY"), os.Getenv("OPENAI_MODEL"); key != "" && model != "" {
+		providerRegistry.Register(openaiprovider.New(key, httpClient))
+		models["openai"] = provider.ModelRef{ID: "openai", Provider: "openai", Model: model}
+	}
+	if key, model := os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("ANTHROPIC_MODEL"); key != "" && model != "" {
+		providerRegistry.Register(anthropicprovider.New(key, httpClient))
+		models["anthropic"] = provider.ModelRef{ID: "anthropic", Provider: "anthropic", Model: model}
+	}
+	if key, model := os.Getenv("GEMINI_API_KEY"), os.Getenv("GEMINI_MODEL"); key != "" && model != "" {
+		providerRegistry.Register(googleprovider.New(key, httpClient))
+		models["google"] = provider.ModelRef{ID: "google", Provider: "google", Model: model}
+	}
+
+	modelRouter := routing.NewModelRouter(models)
+	inferenceService := inference.New(providerRegistry)
+	runtime := yarruntime.NewMulti(
+		agentRouter,
+		modelRouter,
+		inferenceService,
+		memoryRepo,
+		taskRepo,
+		memory.NewExtractor(),
+	)
 
 	toolRegistry := tools.NewRegistry()
 	toolRegistry.Register(tools.Tool{
-		ID: "mock.note.read",
+		ID:          "mock.note.read",
 		Description: "Read mock development notes.",
-		Operation: tools.OperationRead,
-		Risk: tools.RiskLow,
-		Backend: "mock",
+		Operation:   tools.OperationRead,
+		Risk:        tools.RiskLow,
+		Backend:     "mock",
 		InputSchema: json.RawMessage(`{"type":"object"}`),
 	})
 	toolRegistry.Register(tools.Tool{
-		ID: "mock.note.create",
+		ID:          "mock.note.create",
 		Description: "Create a mock development note.",
-		Operation: tools.OperationWrite,
-		Risk: tools.RiskMedium,
-		Backend: "mock",
+		Operation:   tools.OperationWrite,
+		Risk:        tools.RiskMedium,
+		Backend:     "mock",
 		InputSchema: json.RawMessage(`{"type":"object","required":["text"]}`),
 	})
 
 	policyEngine := policy.New(map[string]policy.AgentPolicy{
 		"product-manager": {
-			Allow: map[string]struct{}{"mock.note.read": {}},
+			Allow:            map[string]struct{}{"mock.note.read": {}},
 			ApprovalRequired: map[string]struct{}{"mock.note.create": {}},
-			Deny: map[string]struct{}{},
+			Deny:             map[string]struct{}{},
 		},
 		"technical-product-manager": {
-			Allow: map[string]struct{}{"mock.note.read": {}},
+			Allow:            map[string]struct{}{"mock.note.read": {}},
 			ApprovalRequired: map[string]struct{}{"mock.note.create": {}},
-			Deny: map[string]struct{}{},
+			Deny:             map[string]struct{}{},
 		},
 		"backend-engineer": {
-			Allow: map[string]struct{}{"mock.note.read": {}},
+			Allow:            map[string]struct{}{"mock.note.read": {}},
 			ApprovalRequired: map[string]struct{}{"mock.note.create": {}},
-			Deny: map[string]struct{}{},
+			Deny:             map[string]struct{}{},
 		},
 		"software-architect": {
-			Allow: map[string]struct{}{"mock.note.read": {}},
+			Allow:            map[string]struct{}{"mock.note.read": {}},
 			ApprovalRequired: map[string]struct{}{},
-			Deny: map[string]struct{}{"mock.note.create": {}},
+			Deny:             map[string]struct{}{"mock.note.create": {}},
 		},
 	})
 
@@ -124,7 +157,17 @@ func main() {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "degraded", "database": "unavailable"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "database": "ok", "provider": llm.Name(), "mcp": "/mcp"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":   "ok",
+			"database": "ok",
+			"mcp":      "/mcp",
+			"providers": map[string]bool{
+				"mock":      providerRegistry.Has("mock"),
+				"openai":    providerRegistry.Has("openai"),
+				"anthropic": providerRegistry.Has("anthropic"),
+				"google":    providerRegistry.Has("google"),
+			},
+		})
 	})
 
 	mux.HandleFunc("POST /v1/team/run", func(w http.ResponseWriter, r *http.Request) {
@@ -166,32 +209,32 @@ func main() {
 			return
 		}
 		var body struct {
-			AgentID string `json:"agent_id"`
-			ToolID string `json:"tool_id"`
-			TaskID string `json:"task_id"`
-			IdempotencyKey string `json:"idempotency_key"`
-			ApprovalID string `json:"approval_id"`
-			Arguments json.RawMessage `json:"arguments"`
+			AgentID        string          `json:"agent_id"`
+			ToolID         string          `json:"tool_id"`
+			TaskID         string          `json:"task_id"`
+			IdempotencyKey string          `json:"idempotency_key"`
+			ApprovalID     string          `json:"approval_id"`
+			Arguments      json.RawMessage `json:"arguments"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 			return
 		}
 		result, err := toolExecutor.Execute(r.Context(), tools.Invocation{
-			TenantID: devTenantID,
-			UserID: devUserID,
-			TaskID: body.TaskID,
-			AgentID: body.AgentID,
-			ToolID: body.ToolID,
-			Arguments: body.Arguments,
+			TenantID:       devTenantID,
+			UserID:         devUserID,
+			TaskID:         body.TaskID,
+			AgentID:        body.AgentID,
+			ToolID:         body.ToolID,
+			Arguments:      body.Arguments,
 			IdempotencyKey: body.IdempotencyKey,
-			ApprovalID: body.ApprovalID,
+			ApprovalID:     body.ApprovalID,
 		})
 		if err != nil {
 			var approvalErr *tools.ApprovalRequiredError
 			if errors.As(err, &approvalErr) {
 				writeJSON(w, http.StatusConflict, map[string]any{
-					"error": "APPROVAL_REQUIRED",
+					"error":       "APPROVAL_REQUIRED",
 					"approval_id": approvalErr.ApprovalID,
 				})
 				return
