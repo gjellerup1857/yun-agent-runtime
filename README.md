@@ -2,7 +2,7 @@
 
 Portable, governed multi-agent runtime for running the same AI team across model providers and MCP-compatible clients.
 
-> Status: MVP implementation in progress on `build/yar-mvp`.
+> Status: interactive MVP is Docker/E2E verified on `build/yar-mvp`.
 
 ## Core principles
 
@@ -11,38 +11,47 @@ Portable, governed multi-agent runtime for running the same AI team across model
 - YAR memory is the canonical source of truth
 - Default-deny tool permissions
 - Human approval for write/high-risk actions
-- Model-provider independence with fallback
+- Model-provider independence with retry/failover
 - Modular monolith first
 
-## What already works in the MVP branch
+## Verified MVP capabilities
 
 - Go HTTP runtime
+- Preact/Vite admin console at `http://localhost:3000`
 - `GET /healthz`
 - `POST /v1/team/run`
-- stateless Streamable HTTP MCP endpoint at `POST /mcp`
+- stateless Streamable HTTP MCP endpoint at `/mcp`
 - MCP tools: `yar_profile_get`, `yar_team_run`
 - deterministic 9-agent routing
-- zero-cost Mock provider
+- agent-aware model routing
+- optional OpenAI Responses provider (`store:false`)
+- optional Anthropic Messages provider
+- optional Gemini Interactions provider (`store:false`)
+- zero-cost Mock provider fallback
+- retry/failover for retryable provider failures
 - PostgreSQL + pgvector schema
 - persistent tasks
 - project/user/agent/task memory scopes
 - decision supersession (`Go -> Rust` keeps history)
 - governed tool registry
+- policy-filtered tool discovery
+- Agentic tool loop with hard call/round budgets
 - default-deny policy engine
-- human approval records
+- human approval records and approval resume
 - idempotent write-tool execution
-- audit logging
+- audit logging with argument hashes instead of plaintext payloads
 - Docker Compose local stack
-- GitHub Actions CI
+- GitHub Actions Go/Admin builds
+- Docker end-to-end CI including health, admin and smoke flow
 
-Real model providers, OAuth canonical identity and the Preact admin console are still being added.
+Production OAuth/OIDC identity, provider-native tool calling for every real provider, portable `.yar` packages, and public/cloud deployment remain production-hardening work.
 
 ## Requirements
 
 - Docker + Docker Compose
-- Optional: Go 1.25+ for running outside Docker
+- Optional: Go 1.25+ and Node 22+ for running components outside Docker
 
-No OpenAI, Anthropic or Gemini API key is required for the current MVP because the Mock provider is always available.
+No OpenAI, Anthropic or Gemini API key is required. The Mock provider is always available.
 
 ## Quick start
 
@@ -53,20 +62,38 @@ git checkout build/yar-mvp
 make up
 ```
 
-Then verify:
+Open the interactive admin console:
+
+```text
+http://localhost:3000
+```
+
+YAR API/MCP:
+
+```text
+http://localhost:8080
+http://localhost:8080/mcp
+```
+
+Verify health:
 
 ```bash
 curl http://localhost:8080/healthz
 ```
 
-Expected shape:
+Expected shape without paid provider credentials:
 
 ```json
 {
   "status": "ok",
   "database": "ok",
-  "provider": "mock",
-  "mcp": "/mcp"
+  "mcp": "/mcp",
+  "providers": {
+    "mock": true,
+    "openai": false,
+    "anthropic": false,
+    "google": false
+  }
 }
 ```
 
@@ -76,6 +103,36 @@ Run the whole MVP smoke flow:
 make smoke
 ```
 
+## Admin console
+
+The Preact admin currently includes:
+
+- Overview — runtime/provider/task/memory/approval status
+- Run Team — start or continue a persistent task
+- Tasks — inspect persistent tasks and statuses
+- Memory — inspect active/superseded canonical memory
+- Approvals — approve pending write-tool operations
+- Audit — inspect governed tool activity and payload hashes
+
+The production container serves the Preact bundle through Nginx. `/api/*` is reverse-proxied to the YAR Go service, so the browser does not need cross-origin configuration.
+
+## Optional real model providers
+
+Copy or export values from `.env.example` before `make up`:
+
+```bash
+export OPENAI_API_KEY='...'
+export OPENAI_MODEL='...'
+
+export ANTHROPIC_API_KEY='...'
+export ANTHROPIC_MODEL='...'
+
+export GEMINI_API_KEY='...'
+export GEMINI_MODEL='...'
+```
+
+Only providers that have both a key and model configured are registered. Mock remains available as the final fallback.
+
 ## Remote MCP
 
 YAR exposes the official Model Context Protocol Streamable HTTP transport at:
@@ -84,14 +141,14 @@ YAR exposes the official Model Context Protocol Streamable HTTP transport at:
 http://localhost:8080/mcp
 ```
 
-The server uses the official `github.com/modelcontextprotocol/go-sdk` and runs the HTTP transport in stateless mode for the 2026-07-28 protocol revision.
+The server uses `github.com/modelcontextprotocol/go-sdk` and stateless Streamable HTTP.
 
 Current MCP tools:
 
 - `yar_profile_get` — returns the canonical YAR identity connected to the endpoint.
 - `yar_team_run` — runs or resumes the persistent YAR product engineering team.
 
-The MVP currently binds `/mcp` to the development identity. Production OAuth/OIDC identity resolution is intentionally not enabled yet.
+The MVP currently binds `/mcp` to the development identity. Production OAuth/OIDC subject resolution is intentionally still pending.
 
 ## Stateful team run
 
@@ -145,15 +202,13 @@ curl -X POST http://localhost:8080/v1/dev/tools/execute \
   }'
 ```
 
-Approve it:
+Approve it from the Admin console or:
 
 ```bash
 curl -X POST http://localhost:8080/v1/dev/approvals/<APPROVAL_ID>/approve
 ```
 
-Then repeat the write request with the same `idempotency_key` plus `approval_id`.
-
-Repeating the exact approved write again returns the cached execution result instead of performing the write twice.
+Repeating an already completed write with the same idempotency key returns the cached result rather than performing the side effect twice.
 
 ## Development commands
 
@@ -172,29 +227,57 @@ make smoke
 ## Current architecture
 
 ```text
-MCP Client / REST Client
-  -> YAR HTTP Gateway
-  -> Agent Router
-  -> Stateful Runtime
-       -> PostgreSQL / pgvector memory
-       -> Task continuation
-       -> Mock model provider
-  -> Tool Control Plane
-       -> Registry
-       -> Schema validation
-       -> Default-deny policy
-       -> Approval
-       -> Idempotency
-       -> Audit
-       -> Backend
+ChatGPT / Claude / Gemini / MCP Client / Admin
+                 |
+                 v
+          YAR HTTP + MCP Gateway
+                 |
+        +--------+---------+
+        |                  |
+        v                  v
+   Agent Runtime       Tool Control Plane
+        |                  |
+   Agent Router          Registry
+   Model Router          Schema
+   Memory Context        Default Deny
+   Task Continuation     Approval
+        |                Idempotency
+        v                Audit
+ OpenAI / Anthropic         |
+ Gemini / Mock              v
+                         Backends
+        |
+        v
+ PostgreSQL + pgvector
 ```
 
-## Next implementation targets
+## CI definition of the current MVP
 
-1. Provider Registry + OpenAI / Anthropic / Gemini adapters
-2. Agent model tool-calling loop
-3. OAuth/OIDC canonical identity
-4. Preact admin console
-5. Cross-platform ChatGPT / Claude / Gemini E2E
+Every branch/PR run verifies:
+
+1. `go mod tidy`
+2. `gofmt`
+3. `go vet ./...`
+4. `go test ./...`
+5. `go build ./cmd/server`
+6. Preact TypeScript/Vite production build
+7. Docker Compose build/start
+8. PostgreSQL migrations
+9. YAR health endpoint
+10. Admin HTTP endpoint
+11. Stateful team run
+12. Governed read tool
+13. Approval request + approval
+14. Approved write tool execution
+15. Clean stack shutdown
+
+## Next production targets
+
+1. OAuth/OIDC canonical identity for Remote MCP and REST
+2. Provider-native tool/function calling for OpenAI, Anthropic and Gemini
+3. MCP connector backends for GitHub/ClickUp/Figma/etc.
+4. `.yar` team package build/import/signature verification
+5. encrypted `.yarmem` export/import
+6. public/cloud deployment and cross-platform ChatGPT/Claude/Gemini E2E
 
 Development work is reviewed in PRs before merging to `main`.
