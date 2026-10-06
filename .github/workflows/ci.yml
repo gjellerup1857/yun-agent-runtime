@@ -8,7 +8,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  go:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,3 +28,21 @@ jobs:
         run: go test ./...
       - name: Build
         run: go build ./cmd/server
+
+  admin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: false
+      - name: Install dependencies
+        run: npm install
+      - name: Build admin
+        run: npm run build
